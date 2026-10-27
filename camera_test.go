@@ -64,6 +64,9 @@ func TestCameraEndToEnd(t *testing.T) {
 	if err != nil || len(frames) != 5 {
 		t.Fatalf("%d 帧 %v", len(frames), err)
 	}
+	if st := cam.Stats(); st.DepthFrames < 5 || st.DepthDropped != 0 {
+		t.Errorf("stats %+v", st)
+	}
 	for i := 1; i < len(frames); i++ {
 		if frames[i].Seq != frames[i-1].Seq+1 {
 			t.Fatalf("缓存帧不连续：%d %d", frames[i-1].Seq, frames[i].Seq)

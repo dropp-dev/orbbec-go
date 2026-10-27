@@ -431,6 +431,32 @@ func (c *Camera) RecentDepths(n int, timeout, maxAge time.Duration) ([]*DepthFra
 }
 
 // HasColor 表示 AliveTimeout 内收到过彩色帧。
+// Stats 是流的累计统计：收到的帧数、因 RTP 丢包而丢弃的帧数，以及最近一帧深度的相机帧号
+// （相机帧号的增量减去收到的帧数 = 相机发了但没收全的帧）。
+type Stats struct {
+	DepthFrames, DepthDropped int64
+	ColorFrames, ColorDropped int64
+	DepthDeviceSeq            uint64
+}
+
+// Stats 返回当前流统计；没打开时全零。
+func (c *Camera) Stats() Stats {
+	c.mu.Lock()
+	ds, cs := c.depthStream, c.colorStream
+	var st Stats
+	if n := len(c.ring); n > 0 {
+		st.DepthDeviceSeq = c.ring[n-1].DeviceSeq
+	}
+	c.mu.Unlock()
+	if ds != nil {
+		st.DepthFrames, st.DepthDropped = ds.Stats()
+	}
+	if cs != nil {
+		st.ColorFrames, st.ColorDropped = cs.Stats()
+	}
+	return st
+}
+
 func (c *Camera) HasColor() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
