@@ -17,9 +17,10 @@ type jpegFrameInfo struct {
 	qtables       []byte
 }
 
-// jpegDepay 去掉每包的 RFC 2435 头，首包时记下合成 JPEG 头的参数。
+// jpegDepay 去掉每包的 RFC 2435 头，首包时记下合成 JPEG 头的参数，并校验每包的分片偏移。
 type jpegDepay struct {
 	info jpegFrameInfo
+	got  int // 本帧已拼的扫描数据字节数
 }
 
 func (d *jpegDepay) depay(p rtpPacket, first bool) ([]byte, error) {
@@ -65,16 +66,21 @@ func (d *jpegDepay) depay(p rtpPacket, first bool) ([]byte, error) {
 			return nil, fmt.Errorf("first packet has fragment offset %d", offset)
 		}
 		d.info = jpegFrameInfo{typ: typ, q: q, width: w, height: h, dri: dri, qtables: append([]byte(nil), qt...)}
+		d.got = 0
+	} else if offset != d.got {
+		return nil, fmt.Errorf("fragment offset %d, expected %d", offset, d.got)
 	}
+	d.got += len(b) - n
 	return b[n:], nil
 }
 
-// finish 把拼好的扫描数据变成完整 JPEG。
+// finish 把拼好的扫描数据变成完整 JPEG，返回的切片不和 scan 共享内存。
 func (d *jpegDepay) finish(scan []byte) []byte {
 	if len(scan) >= 2 && scan[0] == 0xFF && scan[1] == 0xD8 {
 		return ensureHuffmanTables(scan)
 	}
 	var out bytes.Buffer
+	out.Grow(len(scan) + 1024)
 	writeJPEGHeader(&out, d.info)
 	out.Write(scan)
 	if !bytes.HasSuffix(scan, []byte{0xFF, 0xD9}) {
@@ -173,8 +179,12 @@ func writeSegment(w *bytes.Buffer, marker byte, body []byte) {
 	w.Write(body)
 }
 
+var standardDHTSegment = buildStandardDHT()
+
 // standardDHT 返回含四张标准表的 DHT 段。
-func standardDHT() []byte {
+func standardDHT() []byte { return standardDHTSegment }
+
+func buildStandardDHT() []byte {
 	var body []byte
 	for _, t := range []struct {
 		class byte
@@ -223,12 +233,12 @@ func writeJPEGHeader(w *bytes.Buffer, info jpegFrameInfo) {
 	writeSegment(w, 0xDA, []byte{3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0})
 }
 
-// ensureHuffmanTables 给缺 DHT 的 JPEG 在 SOS 前补上标准表。
+// ensureHuffmanTables 给缺 DHT 的 JPEG 在 SOS 前补上标准表，返回新切片。
 func ensureHuffmanTables(j []byte) []byte {
 	i := 2
 	for i+4 <= len(j) {
 		if j[i] != 0xFF {
-			return j
+			break
 		}
 		m := j[i+1]
 		if m == 0xFF {
@@ -236,21 +246,25 @@ func ensureHuffmanTables(j []byte) []byte {
 			continue
 		}
 		if m == 0xC4 {
-			return j
+			break
 		}
 		if m == 0xDA {
-			out := make([]byte, 0, len(j)+432)
+			out := make([]byte, 0, len(j)+len(standardDHTSegment))
 			out = append(out, j[:i]...)
-			out = append(out, standardDHT()...)
+			out = append(out, standardDHTSegment...)
 			return append(out, j[i:]...)
 		}
 		if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01 {
 			i += 2
 			continue
 		}
-		i += 2 + int(binary.BigEndian.Uint16(j[i+2:]))
+		l := int(binary.BigEndian.Uint16(j[i+2:]))
+		if l < 2 {
+			break
+		}
+		i += 2 + l
 	}
-	return j
+	return append([]byte(nil), j...)
 }
 
 // jpegMetadata 取出 JPEG COM 段里的帧元数据，没有返回 nil。
@@ -261,11 +275,22 @@ func jpegMetadata(j []byte) []byte {
 			return nil
 		}
 		m := j[i+1]
+		if m == 0xFF {
+			i++
+			continue
+		}
 		if m == 0xDA || m == 0xD9 {
 			return nil
 		}
+		if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01 {
+			i += 2
+			continue
+		}
 		l := int(binary.BigEndian.Uint16(j[i+2:]))
-		if m == 0xFE && i+2+l <= len(j) && bytes.HasPrefix(j[i+4:i+2+l], metadataMagic) {
+		if l < 2 || i+2+l > len(j) {
+			return nil
+		}
+		if m == 0xFE && bytes.HasPrefix(j[i+4:i+2+l], metadataMagic) {
 			return append([]byte(nil), j[i+4:i+2+l]...)
 		}
 		i += 2 + l

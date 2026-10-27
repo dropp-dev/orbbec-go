@@ -47,7 +47,10 @@ type fake435 struct {
 	colorH     int
 	conns      sync.WaitGroup
 	closed     chan struct{}
-	activeConn sync.Map
+	activeConn sync.Map      // net.Conn -> 类型（"ctrl"/"depth"/"color"）
+	padDelay   time.Duration // 控制协议：有效数据和补零之间的延迟（模拟 TCP 分包）
+	garbage    atomic.Bool   // 控制协议：收到请求后回错误魔数并持续吐字节
+	noGVCPRead atomic.Bool   // GVCP：不回应寄存器读
 }
 
 type fakeList struct {
@@ -64,6 +67,9 @@ func newFake435(t *testing.T) *fake435 {
 			PropDeviceCommunicationTypeInt: {},
 			PropCompatVersionInt:           {Cur: 0, Max: 268435455, Min: 1, Def: 1, Step: 1},
 			PropDevicePIDInt:               {Cur: 0x0815, Max: 0x0815, Min: 0x0815, Def: 0x0815, Step: 0x0815},
+			PropStopDepthStreamBool:        {Max: 1, Step: 1},
+			PropStopColorStreamBool:        {Max: 1, Step: 1},
+			PropDepthAlignHardwareBool:     {Max: 1, Step: 1},
 		},
 		structs: map[uint32][]byte{StructVersion: fakeVersionInfo()},
 		lists: map[uint32]fakeList{
@@ -84,9 +90,9 @@ func newFake435(t *testing.T) *fake435 {
 	}
 	f.makeJPEG(64, 40, 80)
 	go f.serveGVCP()
-	go f.accept(f.ctrl, f.serveCtrl)
-	go f.accept(f.depthL, func(c net.Conn) { f.serveRTSP(c, true) })
-	go f.accept(f.colorL, func(c net.Conn) { f.serveRTSP(c, false) })
+	go f.accept(f.ctrl, "ctrl", f.serveCtrl)
+	go f.accept(f.depthL, "depth", func(c net.Conn) { f.serveRTSP(c, true) })
+	go f.accept(f.colorL, "color", func(c net.Conn) { f.serveRTSP(c, false) })
 	t.Cleanup(f.Close)
 	return f
 }
@@ -106,6 +112,16 @@ func (f *fake435) Close() {
 	f.conns.Wait()
 }
 
+// dropConns 断开某一类连接（模拟单路流断线）。
+func (f *fake435) dropConns(kind string) {
+	f.activeConn.Range(func(k, v any) bool {
+		if v == kind {
+			k.(net.Conn).Close()
+		}
+		return true
+	})
+}
+
 func port(a net.Addr) int {
 	_, p, _ := net.SplitHostPort(a.String())
 	n, _ := strconv.Atoi(p)
@@ -118,14 +134,14 @@ func (f *fake435) options() DeviceOptions {
 		DepthRTSPPort: port(f.depthL.Addr()), ColorRTSPPort: port(f.colorL.Addr())}
 }
 
-func (f *fake435) accept(l net.Listener, serve func(net.Conn)) {
+func (f *fake435) accept(l net.Listener, kind string, serve func(net.Conn)) {
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return
 		}
 		f.conns.Add(1)
-		f.activeConn.Store(c, true)
+		f.activeConn.Store(c, kind)
 		go func() {
 			defer f.conns.Done()
 			defer f.activeConn.Delete(c)
@@ -161,6 +177,9 @@ func (f *fake435) serveGVCP() {
 		case gvcpDiscoveryCmd:
 			ack(GevStatusSuccess, gvcpDiscoveryAck, fakeDiscoveryPayload())
 		case gvcpReadRegCmd:
+			if f.noGVCPRead.Load() {
+				continue
+			}
 			addr := binary.BigEndian.Uint32(buf[8:])
 			var v uint32
 			switch addr {
@@ -248,6 +267,15 @@ func (f *fake435) serveCtrl(c net.Conn) {
 		}
 		op := binary.LittleEndian.Uint16(hdr[4:])
 		id := binary.LittleEndian.Uint16(hdr[6:])
+		if f.garbage.Load() {
+			_, _ = c.Write([]byte{0, 0, 4, 0, 0, 0, 0, 0})
+			for {
+				if _, err := c.Write([]byte{0}); err != nil {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
 		code, data := f.handleCtrl(op, payload)
 		resp := make([]byte, 10, 10+len(data))
 		binary.LittleEndian.PutUint16(resp[0:], hpResponseMagic)
@@ -260,7 +288,15 @@ func (f *fake435) serveCtrl(c net.Conn) {
 			resp = append(resp, 0)
 		}
 		if f.padTo > len(resp) {
-			resp = append(resp, make([]byte, f.padTo-len(resp))...)
+			if f.padDelay > 0 {
+				if _, err := c.Write(resp); err != nil {
+					return
+				}
+				time.Sleep(f.padDelay)
+				resp = make([]byte, f.padTo-len(resp))
+			} else {
+				resp = append(resp, make([]byte, f.padTo-len(resp))...)
+			}
 		}
 		if _, err := c.Write(resp); err != nil {
 			return
@@ -466,7 +502,8 @@ func (f *fake435) streamDepth(write func([]byte) error) {
 		binary.LittleEndian.PutUint64(frame[0:], n)
 		binary.LittleEndian.PutUint16(frame[8:], 108)
 		binary.LittleEndian.PutUint64(frame[10:], 700000+n*50) // ms
-		copy(frame[vendorFrameHeaderSize:], "\x00\x00\x00ORBBEC")
+		copy(frame[vendorFrameHeaderSize:], "ORBBEC")
+		binary.LittleEndian.PutUint32(frame[vendorFrameHeaderSize+12:], uint32(n))
 		pix := frame[vendorFrameHeaderSize+108:]
 		for i := range w * h {
 			v := f.depthValue

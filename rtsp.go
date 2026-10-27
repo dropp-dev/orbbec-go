@@ -17,7 +17,15 @@ import (
 
 // 最小 RTSP 客户端：DESCRIBE → SETUP（RTP/AVP/TCP 交织）→ PLAY，之后在同一连接上收 RTP/RTCP。
 
-const rtspUserAgent = "orbbec-go (Open-Orbbec-SDK compatible)"
+const (
+	rtspUserAgent     = "orbbec-go (Open-Orbbec-SDK compatible)"
+	rtspMaxLine       = 4096
+	rtspMaxHeaders    = 64
+	rtspMaxBody       = 1 << 20
+	rtspWriteTimeout  = 5 * time.Second
+	rtspMinSessionTTL = 5 * time.Second
+	rtspMaxSessionTTL = time.Hour
+)
 
 type rtspResponse struct {
 	status  int
@@ -72,7 +80,13 @@ func dialRTSP(ctx context.Context, rawURL string) (*rtspSession, error) {
 		conn: conn, br: bufio.NewReaderSize(conn, 256<<10), url: rawURL,
 		ssrc: uint32(time.Now().UnixNano()), timeout: 60 * time.Second,
 	}
-	if err := s.handshake(ctx); err != nil {
+	// ctx 取消时关连接，让握手里的读写立刻返回
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	err = s.handshake(ctx)
+	if !stop() {
+		err = ctx.Err()
+	}
+	if err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -112,15 +126,7 @@ func (s *rtspSession) handshake(ctx context.Context) error {
 	if sess == "" {
 		return errors.New("RTSP SETUP response has no Session header")
 	}
-	parts := strings.Split(sess, ";")
-	s.session = strings.TrimSpace(parts[0])
-	for _, p := range parts[1:] {
-		if k, v, ok := strings.Cut(strings.TrimSpace(p), "="); ok && strings.EqualFold(k, "timeout") {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				s.timeout = time.Duration(n) * time.Second
-			}
-		}
-	}
+	s.session, s.timeout = parseSessionHeader(sess, s.timeout)
 	s.rtpChan, s.rtcpChan = 0, 1
 	if tr := resp.header("Transport"); tr != "" {
 		for p := range strings.SplitSeq(tr, ";") {
@@ -143,9 +149,23 @@ func (s *rtspSession) handshake(ctx context.Context) error {
 	return err
 }
 
+// parseSessionHeader 解析 "id;timeout=秒"，超时限制在 [rtspMinSessionTTL, rtspMaxSessionTTL]，没写时用 def。
+func parseSessionHeader(h string, def time.Duration) (id string, timeout time.Duration) {
+	parts := strings.Split(h, ";")
+	id, timeout = strings.TrimSpace(parts[0]), def
+	for _, p := range parts[1:] {
+		if k, v, ok := strings.Cut(strings.TrimSpace(p), "="); ok && strings.EqualFold(k, "timeout") {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				timeout = min(max(time.Duration(min(n, 1<<31))*time.Second, rtspMinSessionTTL), rtspMaxSessionTTL)
+			}
+		}
+	}
+	return id, timeout
+}
+
 // do 发一条请求并等对应 CSeq 的响应，期间收到的 RTP 包丢弃。
 func (s *rtspSession) do(method, uri string, headers map[string]string) (*rtspResponse, error) {
-	cseq, err := s.send(method, uri, headers)
+	cseq, err := s.send(method, uri, headers, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -167,10 +187,14 @@ func (s *rtspSession) do(method, uri string, headers map[string]string) (*rtspRe
 	}
 }
 
-func (s *rtspSession) send(method, uri string, headers map[string]string) (int, error) {
+// send 发一条请求，返回它的 CSeq；before 在写入前持锁调用，用来登记要匹配的 CSeq。
+func (s *rtspSession) send(method, uri string, headers map[string]string, before func(cseq int)) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	s.cseq++
+	if before != nil {
+		before(s.cseq)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: %s\r\n", method, uri, s.cseq, rtspUserAgent)
 	if s.session != "" {
@@ -180,8 +204,16 @@ func (s *rtspSession) send(method, uri string, headers map[string]string) (int, 
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}
 	b.WriteString("\r\n")
-	_, err := io.WriteString(s.conn, b.String())
+	_, err := s.writeLocked([]byte(b.String()))
 	return s.cseq, err
+}
+
+// writeLocked 带写超时写入，调用方持 wmu。
+func (s *rtspSession) writeLocked(b []byte) (int, error) {
+	_ = s.conn.SetWriteDeadline(time.Now().Add(rtspWriteTimeout))
+	n, err := s.conn.Write(b)
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	return n, err
 }
 
 // readMessage 读下一条消息：交织包返回通道和数据（下次调用前有效），否则返回 RTSP 响应。
@@ -200,30 +232,37 @@ func (s *rtspSession) readMessage() (byte, []byte, *rtspResponse, error) {
 		if _, err := s.br.Discard(4); err != nil {
 			return 0, nil, nil, err
 		}
-		if n <= s.br.Size() {
-			data, err := s.br.Peek(n)
-			if err != nil {
-				return 0, nil, nil, err
-			}
-			_, _ = s.br.Discard(n)
-			return ch, data, nil, nil
-		}
-		data := make([]byte, n)
-		if _, err := io.ReadFull(s.br, data); err != nil {
+		data, err := s.br.Peek(n)
+		if err != nil {
 			return 0, nil, nil, err
 		}
+		_, _ = s.br.Discard(n)
 		return ch, data, nil, nil
 	}
 	resp, err := s.readResponse()
 	return 0, nil, resp, err
 }
 
+// readLine 读一行（不含换行），超过 rtspMaxLine 报错。
+func (s *rtspSession) readLine() (string, error) {
+	line, err := s.br.ReadSlice('\n')
+	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", errors.New("RTSP line too long")
+		}
+		return "", err
+	}
+	if len(line) > rtspMaxLine {
+		return "", errors.New("RTSP line too long")
+	}
+	return strings.TrimRight(string(line), "\r\n"), nil
+}
+
 func (s *rtspSession) readResponse() (*rtspResponse, error) {
-	line, err := s.br.ReadString('\n')
+	line, err := s.readLine()
 	if err != nil {
 		return nil, err
 	}
-	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "RTSP/") {
 		return nil, fmt.Errorf("unexpected RTSP data %q", truncate(line, 80))
 	}
@@ -240,13 +279,15 @@ func (s *rtspSession) readResponse() (*rtspResponse, error) {
 		resp.reason = fields[2]
 	}
 	for {
-		h, err := s.br.ReadString('\n')
+		h, err := s.readLine()
 		if err != nil {
 			return nil, err
 		}
-		h = strings.TrimRight(h, "\r\n")
 		if h == "" {
 			break
+		}
+		if len(resp.headers) >= rtspMaxHeaders {
+			return nil, errors.New("too many RTSP headers")
 		}
 		if k, v, ok := strings.Cut(h, ":"); ok {
 			resp.headers[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
@@ -254,7 +295,7 @@ func (s *rtspSession) readResponse() (*rtspResponse, error) {
 	}
 	if cl := resp.header("Content-Length"); cl != "" {
 		n, err := strconv.Atoi(cl)
-		if err != nil || n < 0 || n > 1<<20 {
+		if err != nil || n < 0 || n > rtspMaxBody {
 			return nil, fmt.Errorf("invalid Content-Length %q", cl)
 		}
 		resp.body = make([]byte, n)
@@ -343,26 +384,22 @@ func (s *rtspSession) sendReceiverReport() error {
 	binary.BigEndian.PutUint32(pkt[8:], s.ssrc)
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	_ = s.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err := s.conn.Write(pkt)
+	_, err := s.writeLocked(pkt)
 	return err
 }
 
-// teardown 发 TEARDOWN，最多等 wait 让读循环收到响应，然后关闭连接。
+// teardown 发 TEARDOWN，最多等 wait 让读循环收到响应，然后关闭连接。wait 为 0 时发完就关。
 func (s *rtspSession) teardown(wait time.Duration) {
 	if s.session != "" {
 		done := make(chan struct{})
-		s.wmu.Lock()
-		s.teardownDone = done
-		s.wmu.Unlock()
 		u := s.sessionURL
 		if u == "" {
 			u = s.url
 		}
-		if cseq, err := s.send("TEARDOWN", u, nil); err == nil {
-			s.wmu.Lock()
-			s.teardownCSeq = cseq
-			s.wmu.Unlock()
+		_, err := s.send("TEARDOWN", u, nil, func(cseq int) {
+			s.teardownCSeq, s.teardownDone = cseq, done
+		})
+		if err == nil && wait > 0 {
 			select {
 			case <-done:
 			case <-time.After(wait):
@@ -370,4 +407,16 @@ func (s *rtspSession) teardown(wait time.Duration) {
 		}
 	}
 	_ = s.conn.Close()
+}
+
+// isTeardownResponse 由读循环调用：是 TEARDOWN 的响应时通知 teardown 并返回 true。
+func (s *rtspSession) isTeardownResponse(resp *rtspResponse) bool {
+	s.wmu.Lock()
+	cseq, done := s.teardownCSeq, s.teardownDone
+	s.wmu.Unlock()
+	if cseq == 0 || resp.header("CSeq") != strconv.Itoa(cseq) {
+		return false
+	}
+	close(done)
+	return true
 }

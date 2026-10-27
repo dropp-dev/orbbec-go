@@ -40,7 +40,7 @@ func TestVendorPadding(t *testing.T) {
 		f := newFake435(t)
 		f.padTo = pad
 		o := f.options()
-		vc, err := dialVendor(o.IP, o.ControlPort, time.Second)
+		vc, err := dialVendor(context.Background(), o.IP, o.ControlPort, time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +94,7 @@ func TestGVCPControl(t *testing.T) {
 	if err != nil || d.Model != "Gemini 435Le" || d.Firmware != "1.3.19" || d.MAC != "54:14:FD:25:A4:44" || d.IP != "127.0.0.1" || d.PID != 0x0815 {
 		t.Fatalf("发现：%+v %v", d, err)
 	}
-	ccp, err := acquireCCP(a, firmwareVersionInt(d.Firmware), d.Serial, quietLogger())
+	ccp, err := acquireCCP(a, firmwareVersionInt(d.Firmware), d.Serial, quietLogger(), 0)
 	if err != nil || ccp == nil {
 		t.Fatalf("申请控制权：%v", err)
 	}
@@ -103,11 +103,11 @@ func TestGVCPControl(t *testing.T) {
 	}
 	b, _ := dialGVCP(o.IP, o.GVCPPort)
 	defer b.Close()
-	if _, err := acquireCCP(b, 10319, "", quietLogger()); !errors.Is(err, ErrAccessDenied) {
+	if _, err := acquireCCP(b, 10319, "", quietLogger(), 0); !errors.Is(err, ErrAccessDenied) {
 		t.Fatalf("第二个程序申请应被拒绝，得到 %v", err)
 	}
 	// 老固件不支持 CCP：直接放行
-	if c, err := acquireCCP(b, 10300, "", quietLogger()); c != nil || err != nil {
+	if c, err := acquireCCP(b, 10300, "", quietLogger(), 0); c != nil || err != nil {
 		t.Fatalf("老固件应跳过 CCP：%v %v", c, err)
 	}
 	ccp.release()
@@ -121,15 +121,11 @@ func TestCCPKeepaliveReacquire(t *testing.T) {
 	o := f.options()
 	g, _ := dialGVCP(o.IP, o.GVCPPort)
 	defer g.Close()
-	ccp, err := acquireCCP(g, 10319, "", slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	// 短周期的保活方便测试
+	ccp, err := acquireCCP(g, 10319, "", slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug})), 20*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 换成短周期的保活方便测试
-	close(ccp.stop)
-	<-ccp.done
-	ccp.stop, ccp.done = make(chan struct{}), make(chan struct{})
-	go ccp.keepalive(20 * time.Millisecond)
 	defer ccp.release()
 
 	f.clearCCP()
@@ -405,7 +401,9 @@ func TestDeviceOpenAgainstFake(t *testing.T) {
 	}
 
 	// 保持当前档位
+	f.mu.Lock()
 	f.props[PropDepthPrecisionLevelInt] = PropertyRange{Cur: 4, Max: 4, Def: 0, Step: 1}
+	f.mu.Unlock()
 	keep := PrecisionKeep
 	o.DepthPrecision = &keep
 	d2, err := OpenDevice(context.Background(), o)

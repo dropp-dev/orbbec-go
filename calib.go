@@ -198,6 +198,9 @@ func (c *Calibration) intrinsics(color bool, w, h int) (Intrinsics, error) {
 		if color {
 			ci = c.align[0].rgb
 		}
+		if ci.width == 0 || ci.height == 0 || int(ci.height)*w != int(ci.width)*h {
+			return Intrinsics{}, fmt.Errorf("no calibration for %dx%d (calibrated %dx%d)", w, h, ci.width, ci.height)
+		}
 		return scaleIntrinsic(ci, w), nil
 	}
 	if int(p.paramIndex) >= len(c.align) {

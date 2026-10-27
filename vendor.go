@@ -1,6 +1,7 @@
 package orbbec
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ const (
 
 	listChunkSize   = 768
 	hpRespErrorBusy = 0x0003
+
+	// 435Le 把每条响应补零到固定长度，头里的长度只算有效数据。
+	vendorRespPad = 1022
+	drainMaxBytes = 64 << 10
 )
 
 // DeviceError 是相机对命令返回的错误码。
@@ -58,29 +63,30 @@ type vendorClient struct {
 	mu      sync.Mutex
 	addr    string
 	conn    net.Conn
+	closed  bool
 	reqID   uint16
 	timeout time.Duration
 	buf     []byte
-	// 435Le 把每条响应补零到固定长度（1022 字节），头里的长度只算有效数据。
-	// padTo：0 未探测，-1 不补齐，>0 补齐到的长度。
+	// padTo：响应补齐到的长度，0 = 还没确认（第一条响应时按 vendorRespPad 试读），-1 = 不补齐。
 	padTo int
 }
 
-func dialVendor(ip string, port int, timeout time.Duration) (*vendorClient, error) {
+func dialVendor(ctx context.Context, ip string, port int, timeout time.Duration) (*vendorClient, error) {
 	c := &vendorClient{
 		addr:    net.JoinHostPort(ip, fmt.Sprint(port)),
 		reqID:   uint16(rand.Uint32()),
 		timeout: timeout,
 		buf:     make([]byte, 4096),
 	}
-	if err := c.connect(); err != nil {
+	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func (c *vendorClient) connect() error {
-	conn, err := net.DialTimeout("tcp", c.addr, 2*time.Second)
+func (c *vendorClient) connect(ctx context.Context) error {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", c.addr)
 	if err != nil {
 		return fmt.Errorf("connect control port %s: %w", c.addr, err)
 	}
@@ -93,9 +99,11 @@ func (c *vendorClient) connect() error {
 	return nil
 }
 
+// Close 断开并拒绝之后的命令。
 func (c *vendorClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed = true
 	if c.conn == nil {
 		return nil
 	}
@@ -118,8 +126,11 @@ func (c *vendorClient) request(op uint16, payload []byte) ([]byte, uint16) {
 
 // roundTrip 发一条命令，返回响应数据（不含响应头）。错位或相机忙时重试一次。
 func (c *vendorClient) roundTrip(op uint16, payload []byte, propID uint32) ([]byte, error) {
+	if c.closed {
+		return nil, ErrClosed
+	}
 	if c.conn == nil {
-		if err := c.connect(); err != nil {
+		if err := c.connect(context.Background()); err != nil {
 			return nil, err
 		}
 	}
@@ -129,11 +140,12 @@ func (c *vendorClient) roundTrip(op uint16, payload []byte, propID uint32) ([]by
 			time.Sleep(100 * time.Millisecond)
 		}
 		req, id := c.request(op, payload)
-		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
+		deadline := time.Now().Add(c.timeout)
+		_ = c.conn.SetDeadline(deadline)
 		if _, err := c.conn.Write(req); err != nil {
 			return nil, c.ioFailed(err)
 		}
-		resp, err := c.readResponse()
+		resp, err := c.readResponse(deadline)
 		if err != nil {
 			return nil, c.ioFailed(err)
 		}
@@ -145,11 +157,11 @@ func (c *vendorClient) roundTrip(op uint16, payload []byte, propID uint32) ([]by
 		switch {
 		case magic != hpResponseMagic:
 			lastErr = fmt.Errorf("bad response magic %#04x", magic)
-			c.drain()
+			c.drain(deadline)
 			continue
 		case rid != id:
 			lastErr = fmt.Errorf("response id %d does not match request %d", rid, id)
-			c.drain()
+			c.drain(deadline)
 			continue
 		case rop != op:
 			return nil, fmt.Errorf("response opcode %d does not match request %d", rop, op)
@@ -166,15 +178,27 @@ func (c *vendorClient) roundTrip(op uint16, payload []byte, propID uint32) ([]by
 	return nil, lastErr
 }
 
-// drain 丢掉连接里残留的字节，重新对齐。
-func (c *vendorClient) drain() {
-	for {
-		_ = c.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		if _, err := c.conn.Read(c.buf); err != nil {
+// drain 丢掉连接里残留的字节重新对齐：读到连接空闲 100 ms、超过本条命令的期限或 drainMaxBytes 为止；
+// 还没对齐就断开，下一条命令重连。
+func (c *vendorClient) drain(deadline time.Time) {
+	total := 0
+	for total < drainMaxBytes {
+		d := time.Now().Add(100 * time.Millisecond)
+		if deadline.Before(d) {
+			d = deadline
+		}
+		_ = c.conn.SetReadDeadline(d)
+		n, err := c.conn.Read(c.buf)
+		total += n
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Now().Before(deadline) {
+				return
+			}
 			break
 		}
 	}
-	c.padTo = 0
+	_ = c.ioFailed(errors.New("control channel out of sync"))
 }
 
 // ioFailed 断开连接，下一条命令自动重连。
@@ -187,7 +211,7 @@ func (c *vendorClient) ioFailed(err error) error {
 }
 
 // readResponse 读一条响应并跳过补零。
-func (c *vendorClient) readResponse() ([]byte, error) {
+func (c *vendorClient) readResponse(deadline time.Time) ([]byte, error) {
 	if _, err := io.ReadFull(c.conn, c.buf[:reqHeaderSize]); err != nil {
 		return nil, err
 	}
@@ -199,43 +223,37 @@ func (c *vendorClient) readResponse() ([]byte, error) {
 		return nil, err
 	}
 	resp := append([]byte(nil), c.buf[:total]...)
-	if err := c.skipPadding(total); err != nil {
+	if err := c.skipPadding(total, deadline); err != nil {
 		return nil, err
 	}
 	return resp, nil
 }
 
-// skipPadding 读掉补零。第一条响应时探测补齐长度：读到连接空闲为止。
-func (c *vendorClient) skipPadding(got int) error {
-	switch {
-	case c.padTo < 0:
+// skipPadding 读掉补零。第一条响应时按 vendorRespPad 试读：在本条命令的期限内读不到补零就记为不补齐。
+func (c *vendorClient) skipPadding(got int, deadline time.Time) error {
+	if c.padTo < 0 || got >= vendorRespPad {
 		return nil
-	case c.padTo > 0:
-		if got >= c.padTo {
-			return nil
-		}
-		_, err := io.ReadFull(c.conn, c.buf[:c.padTo-got])
+	}
+	want := vendorRespPad - got
+	if c.padTo > 0 {
+		_, err := io.ReadFull(c.conn, c.buf[:want])
 		return err
 	}
-	n := got
-	for n < len(c.buf) {
-		_ = c.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-		k, err := c.conn.Read(c.buf[:len(c.buf)-n])
+	n := 0
+	for n < want {
+		_ = c.conn.SetReadDeadline(deadline)
+		k, err := c.conn.Read(c.buf[n:want])
 		n += k
 		if err != nil {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				break
+			if errors.As(err, &ne) && ne.Timeout() && n == 0 {
+				c.padTo = -1
+				return nil
 			}
 			return err
 		}
 	}
-	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
-	if n == got {
-		c.padTo = -1
-	} else {
-		c.padTo = n
-	}
+	c.padTo = vendorRespPad
 	return nil
 }
 
@@ -305,11 +323,12 @@ func (c *vendorClient) GetStructList(id uint32, cmdVer uint16) ([]byte, error) {
 		n := min(listChunkSize, size-off)
 		payload := binary.LittleEndian.AppendUint32(binary.LittleEndian.AppendUint32(u32(id), off), n)
 		chunk, err := c.roundTrip(opReadStructList, payload, id)
-		if err != nil {
-			return nil, err
+		if err == nil && uint32(len(chunk)) < n {
+			err = fmt.Errorf("struct list %d: want %d bytes at offset %d, got %d", id, n, off, len(chunk))
 		}
-		if uint32(len(chunk)) < n {
-			return nil, fmt.Errorf("struct list %d: want %d bytes at offset %d, got %d", id, n, off, len(chunk))
+		if err != nil {
+			_, _ = c.roundTrip(opFinishReadStructList, u32(id), id)
+			return nil, err
 		}
 		out = append(out, chunk[:n]...)
 	}

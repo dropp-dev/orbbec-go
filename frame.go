@@ -117,7 +117,7 @@ func splitVendorFrame(b []byte) (vendorFrameHeader, []byte, []byte, error) {
 	return h, b[vendorFrameHeaderSize:off], b[off:], nil
 }
 
-// decodeY16 把小端 Y16 换算成 mm（乘单位后截断）。
+// decodeY16 把小端 Y16 换算成 mm（乘单位后四舍五入）。
 func decodeY16(data []byte, w, h int, unit float32) ([]uint16, error) {
 	n := w * h
 	if len(data) < n*2 {
@@ -131,7 +131,7 @@ func decodeY16(data []byte, w, h int, unit float32) ([]uint16, error) {
 		return dst, nil
 	}
 	for i := range n {
-		v := float32(binary.LittleEndian.Uint16(data[i*2:])) * unit
+		v := float32(binary.LittleEndian.Uint16(data[i*2:]))*unit + 0.5
 		dst[i] = uint16(min(v, math.MaxUint16))
 	}
 	return dst, nil

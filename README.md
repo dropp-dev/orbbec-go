@@ -53,7 +53,11 @@ if !cam.IsAlive(0) {                                        // 断电、拔网�
 }
 ```
 
-更底层的 `orbbec.OpenDevice` 可以只读打开（不占控制权）、读写属性（如 `PropLaserBool`）、单独起深度或彩色流。
+取帧超时返回 `ErrTimeout`，`Close()` 之后返回 `ErrClosed`；`IsAlive` 只看深度流，彩色流断了不算离线。
+帧回调（`Device.StartDepth` 的 `onFrame`）在收帧 goroutine 上执行，不要阻塞，也不要在里面调 `Close`。
+
+更底层的 `orbbec.OpenDevice` 可以只读打开（不占控制权）、读写属性（如 `PropLaserBool`）、单独起深度或彩色流；
+`Device.Close()` 会先关掉它起的流。
 
 ## obprobe
 
@@ -101,7 +105,8 @@ obprobe watch -ip 192.168.1.10            # 长时间运行，每 10 秒报一�
 ## 测试
 
 ```bash
-go test ./...   # 内置模拟相机（GVCP + 控制协议 + RTSP），标定数据来自真机
+go test -race ./...                       # 内置模拟相机（GVCP + 控制协议 + RTSP），标定数据来自真机
+go test -run='^$' -fuzz=FuzzJPEG -fuzztime=30s .   # 协议解析器的 fuzz（FuzzParseRTP / FuzzJPEG / FuzzVendorFrame / FuzzGVCPAndCalib）
 ```
 
 ## 许可证

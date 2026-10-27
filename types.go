@@ -50,10 +50,11 @@ type DepthFrame struct {
 // At 返回 (u, v) 处的深度。
 func (f *DepthFrame) At(u, v int) uint16 { return f.Data[v*f.Width+u] }
 
-// Clone 深拷贝一帧。
+// Clone 深拷贝一帧（Data 和 Metadata 都复制）。
 func (f *DepthFrame) Clone() *DepthFrame {
 	c := *f
 	c.Data = append([]uint16(nil), f.Data...)
+	c.Metadata = append([]byte(nil), f.Metadata...)
 	return &c
 }
 
@@ -64,4 +65,12 @@ type ColorFrame struct {
 	Seq           uint64
 	Time          time.Time
 	Metadata      []byte // JPEG COM 段里的帧元数据
+}
+
+// Clone 深拷贝一帧（JPEG 和 Metadata 都复制）。
+func (f *ColorFrame) Clone() *ColorFrame {
+	c := *f
+	c.JPEG = append([]byte(nil), f.JPEG...)
+	c.Metadata = append([]byte(nil), f.Metadata...)
+	return &c
 }

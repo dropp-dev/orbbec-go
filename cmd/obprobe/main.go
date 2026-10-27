@@ -167,13 +167,14 @@ func grab(ctx context.Context, cam *orbbec.Camera, secs int, out string) error {
 		return err
 	}
 	last := first
-	for deadline := time.Now().Add(time.Duration(secs) * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(time.Duration(secs) * time.Second); time.Now().Before(deadline) && ctx.Err() == nil; {
 		if last, err = cam.GrabDepth(3 * time.Second); err != nil {
 			return err
 		}
 	}
-	n, dt := last.Seq-first.Seq, last.Time.Sub(first.Time)
-	fmt.Printf("depth: %d frames in %v (%.1f fps)\n", n, dt.Round(time.Millisecond), float64(n)/dt.Seconds())
+	if n, dt := last.Seq-first.Seq, last.Time.Sub(first.Time); n > 0 && dt > 0 {
+		fmt.Printf("depth: %d frames in %v (%.1f fps)\n", n, dt.Round(time.Millisecond), float64(n)/dt.Seconds())
+	}
 	valid := 0
 	for _, v := range last.Data {
 		if v > 0 {
@@ -201,7 +202,7 @@ func grab(ctx context.Context, cam *orbbec.Camera, secs int, out string) error {
 		return err
 	}
 	fmt.Println("saved", f.Name())
-	if c, _ := cam.GrabColor(2 * time.Second); c != nil {
+	if c, err := cam.GrabColor(2 * time.Second); err == nil {
 		p := filepath.Join(out, "color.jpg")
 		if err := os.WriteFile(p, c.JPEG, 0o644); err != nil {
 			return err
@@ -218,7 +219,16 @@ func watch(ctx context.Context, cam *orbbec.Camera, log *slog.Logger) error {
 	defer cam.Close()
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
-	var depthSeq, colorSeq uint64
+	// 序号跨重连累加，统计基准取当前序号
+	baseline := func() (uint64, uint64) {
+		f, err := cam.GrabDepth(2 * time.Second)
+		if err != nil {
+			return 0, 0
+		}
+		_, cs := cam.LatestColor(0, 0)
+		return f.Seq, cs
+	}
+	depthSeq, colorSeq := baseline()
 	since := time.Now()
 	for {
 		select {
@@ -233,7 +243,8 @@ func watch(ctx context.Context, cam *orbbec.Camera, log *slog.Logger) error {
 				log.Error("reopen failed", "err", err)
 				continue
 			}
-			depthSeq, colorSeq, since = 0, 0, time.Now()
+			depthSeq, colorSeq = baseline()
+			since = time.Now()
 			continue
 		}
 		f, err := cam.GrabDepth(2 * time.Second)

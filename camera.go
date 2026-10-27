@@ -17,16 +17,17 @@ type Config struct {
 	GVCPPort, ControlPort, DepthRTSPPort, ColorRTSPPort int
 
 	Depth StreamConfig // 默认 1280x800@10
-	// Color 为 nil 时用 1280x800@10，NoColor 为 true 时不开彩色流。
+	// Color 为 nil 时用 1280x800@10；NoColor 为 true 时不开彩色流（优先于 Color）。
 	Color   *StreamConfig
 	NoColor bool
 
 	DepthPrecision *DepthPrecision // 见 DeviceOptions.DepthPrecision
 
-	RingSize     int           // 缓存的深度帧数，默认 8
-	AliveTimeout time.Duration // 多久没有新帧算离线，默认 3 s
-	OpenRetries  int           // 默认 5
-	RetryWait    time.Duration // 默认 3 s
+	RingSize         int           // 缓存的深度帧数，默认 8
+	AliveTimeout     time.Duration // 多久没有新深度帧算离线，默认 3 s
+	OpenRetries      int           // 默认 5
+	RetryWait        time.Duration // 默认 3 s
+	FrameIdleTimeout time.Duration // 见 DeviceOptions.FrameIdleTimeout
 }
 
 func (c *Config) withDefaults() Config {
@@ -37,8 +38,17 @@ func (c *Config) withDefaults() Config {
 	if out.Depth.Width == 0 {
 		out.Depth = StreamConfig{1280, 800, 10}
 	}
-	if out.Color == nil && !out.NoColor {
+	if out.NoColor {
+		out.Color = nil
+	} else if out.Color == nil {
 		out.Color = &StreamConfig{1280, 800, 10}
+	} else {
+		cc := *out.Color
+		out.Color = &cc
+	}
+	if out.DepthPrecision != nil {
+		p := *out.DepthPrecision
+		out.DepthPrecision = &p
 	}
 	if out.RingSize <= 0 {
 		out.RingSize = 8
@@ -55,11 +65,21 @@ func (c *Config) withDefaults() Config {
 	return out
 }
 
-// Camera 持续接收深度和彩色并缓存最近几帧。离线后 IsAlive 返回 false，Close 再 Open 即可重连。
-// 返回的帧是共享的，只读；要修改先 Clone。
+var (
+	// ErrTimeout 表示在给定时间内没有等到帧。
+	ErrTimeout = errors.New("timed out waiting for a frame")
+	// ErrAlreadyOpen 表示 Camera 已经打开。
+	ErrAlreadyOpen = errors.New("camera is already open")
+)
+
+// Camera 持续接收深度和彩色并缓存最近几帧。深度流停了 IsAlive 返回 false，Close 再 Open 即可重连。
+// 返回的帧是共享的，只读；要修改先 Clone。必须用 New 创建；Open/Close 可以和取帧方法并发调用。
 type Camera struct {
 	cfg Config
 	log *slog.Logger
+
+	lifecycle  sync.Mutex // 串行化 Open/Close
+	openCancel context.CancelFunc
 
 	mu          sync.Mutex
 	dev         *Device
@@ -73,10 +93,10 @@ type Camera struct {
 	ring      []*DepthFrame
 	depthSeq  uint64
 	depthAt   time.Time
+	depthErr  error
 	color     *ColorFrame
 	colorSeq  uint64
 	colorAt   time.Time
-	frameAt   time.Time
 	notify    chan struct{} // 每来一帧关闭并换新
 	streamErr error
 }
@@ -87,33 +107,56 @@ func New(cfg Config) *Camera {
 	return &Camera{cfg: c, log: c.Logger, notify: make(chan struct{})}
 }
 
-// Open 连接相机并开始取流，失败时按 RetryWait 重试。
+// Open 连接相机并开始取流，失败时按 RetryWait 重试。已打开时返回 ErrAlreadyOpen。
 func (c *Camera) Open() error { return c.OpenContext(context.Background()) }
 
-// OpenContext 同 Open，可取消。
+// OpenContext 同 Open，可取消；Close 也会中断正在进行的打开。
 func (c *Camera) OpenContext(ctx context.Context) error {
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	c.mu.Lock()
+	open := c.dev != nil
+	c.mu.Unlock()
+	if open {
+		return ErrAlreadyOpen
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c.mu.Lock()
+	c.openCancel = cancel
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.openCancel = nil
+		c.mu.Unlock()
+	}()
+
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.OpenRetries; attempt++ {
 		if lastErr = c.openOnce(ctx); lastErr == nil {
 			return nil
 		}
-		_ = c.Close()
-		if attempt == c.cfg.OpenRetries || ctx.Err() != nil {
-			break
+		c.closeLocked()
+		if ctx.Err() != nil {
+			return fmt.Errorf("open camera: %w", lastErr)
+		}
+		if attempt == c.cfg.OpenRetries {
+			return fmt.Errorf("open camera: %d attempts failed: %w", attempt, lastErr)
 		}
 		c.log.Warn("open camera failed, retrying", "attempt", attempt, "err", lastErr, "wait", c.cfg.RetryWait)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("open camera: %w", ctx.Err())
 		case <-time.After(c.cfg.RetryWait):
 		}
 	}
-	return fmt.Errorf("open camera: %d attempts failed: %w", c.cfg.OpenRetries, lastErr)
+	return lastErr
 }
 
 func (c *Camera) openOnce(ctx context.Context) error {
 	dev, err := OpenDevice(ctx, DeviceOptions{IP: c.cfg.IP, Logger: c.log, DepthPrecision: c.cfg.DepthPrecision,
-		GVCPPort: c.cfg.GVCPPort, ControlPort: c.cfg.ControlPort, DepthRTSPPort: c.cfg.DepthRTSPPort, ColorRTSPPort: c.cfg.ColorRTSPPort})
+		GVCPPort: c.cfg.GVCPPort, ControlPort: c.cfg.ControlPort, DepthRTSPPort: c.cfg.DepthRTSPPort,
+		ColorRTSPPort: c.cfg.ColorRTSPPort, FrameIdleTimeout: c.cfg.FrameIdleTimeout})
 	if err != nil {
 		return err
 	}
@@ -123,18 +166,9 @@ func (c *Camera) openOnce(ctx context.Context) error {
 		dev.Close()
 		return err
 	}
-	var cp *ColorParams
-	if c.cfg.Color != nil {
-		ci, err1 := cal.ColorIntrinsics(c.cfg.Color.Width, c.cfg.Color.Height)
-		ext, ok := cal.DepthToColor()
-		if err1 == nil && ok {
-			cp = &ColorParams{Intrinsics: ci, DepthToRGB: ext}
-		}
-	}
-
 	c.mu.Lock()
-	c.dev, c.intr, c.colorParams, c.info, c.baseline = dev, intr, cp, dev.Info(), cal.BaselineMM()
-	c.ring, c.color, c.streamErr = nil, nil, nil
+	c.dev, c.intr, c.colorParams, c.info, c.baseline = dev, intr, nil, dev.Info(), cal.BaselineMM()
+	c.ring, c.color, c.streamErr, c.depthErr = nil, nil, nil, nil
 	c.mu.Unlock()
 
 	ds, err := dev.StartDepth(ctx, c.cfg.Depth, c.onDepth)
@@ -152,20 +186,26 @@ func (c *Camera) openOnce(ctx context.Context) error {
 		if err != nil {
 			c.log.Warn("color stream unavailable, depth only", "err", err)
 		} else {
+			var cp *ColorParams
+			if ci, err := cal.ColorIntrinsics(c.cfg.Color.Width, c.cfg.Color.Height); err == nil {
+				if ext, ok := cal.DepthToColor(); ok {
+					cp = &ColorParams{Intrinsics: ci, DepthToRGB: ext}
+				}
+			}
 			c.mu.Lock()
-			c.colorStream = cs
+			c.colorStream, c.colorParams = cs, cp
 			c.mu.Unlock()
 			go c.watch(cs, "color")
 		}
 	}
 
-	if _, err := c.GrabDepth(5 * time.Second); err != nil {
+	if _, err := c.grabDepth(ctx, 5*time.Second); err != nil {
 		return err
 	}
 	return nil
 }
 
-// watch 记录流异常结束的原因。
+// watch 记录流异常结束的原因并唤醒等帧的调用方。
 func (c *Camera) watch(s *Stream, name string) {
 	<-s.Done()
 	if err := s.Err(); err != nil {
@@ -174,6 +214,10 @@ func (c *Camera) watch(s *Stream, name string) {
 		if c.streamErr == nil {
 			c.streamErr = fmt.Errorf("%s stream stopped: %w", name, err)
 		}
+		if name == "depth" && (c.depthStream == s || c.depthStream == nil) {
+			c.depthErr = fmt.Errorf("depth stream stopped: %w", err)
+		}
+		c.broadcastLocked()
 		c.mu.Unlock()
 	}
 }
@@ -192,7 +236,7 @@ func (c *Camera) onDepth(f *DepthFrame) {
 	if len(c.ring) > c.cfg.RingSize {
 		c.ring = append(c.ring[:0], c.ring[len(c.ring)-c.cfg.RingSize:]...)
 	}
-	c.depthAt, c.frameAt = f.Time, f.Time
+	c.depthAt = f.Time
 	c.broadcastLocked()
 }
 
@@ -201,16 +245,29 @@ func (c *Camera) onColor(f *ColorFrame) {
 	defer c.mu.Unlock()
 	c.colorSeq++
 	f.Seq = c.colorSeq
-	c.color, c.colorAt, c.frameAt = f, f.Time, f.Time
+	c.color, c.colorAt = f, f.Time
 	c.broadcastLocked()
 }
 
-// Close 关流并释放控制权，可重复调用。
+// Close 关流并释放控制权，可重复调用；会中断正在进行的 Open。
 func (c *Camera) Close() error {
+	c.mu.Lock()
+	if c.openCancel != nil {
+		c.openCancel()
+	}
+	c.mu.Unlock()
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	c.closeLocked()
+	return nil
+}
+
+// closeLocked 关掉当前会话，调用方持 lifecycle。
+func (c *Camera) closeLocked() {
 	c.mu.Lock()
 	ds, cs, dev := c.depthStream, c.colorStream, c.dev
 	c.depthStream, c.colorStream, c.dev = nil, nil, nil
-	c.ring, c.color = nil, nil
+	c.ring, c.color, c.colorParams = nil, nil, nil
 	c.broadcastLocked()
 	c.mu.Unlock()
 	if cs != nil {
@@ -222,7 +279,6 @@ func (c *Camera) Close() error {
 	if dev != nil {
 		dev.Close()
 	}
-	return nil
 }
 
 // Intrinsics 返回深度流内参。
@@ -232,11 +288,15 @@ func (c *Camera) Intrinsics() Intrinsics {
 	return c.intr
 }
 
-// ColorParams 返回彩色内参和深度到彩色外参，没有彩色流时为 nil。
+// ColorParams 返回彩色内参和深度到彩色外参（副本），没有彩色流时为 nil。
 func (c *Camera) ColorParams() *ColorParams {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.colorParams
+	if c.colorParams == nil {
+		return nil
+	}
+	cp := *c.colorParams
+	return &cp
 }
 
 // DeviceInfo 返回设备信息。
@@ -253,14 +313,14 @@ func (c *Camera) BaselineMM() float64 {
 	return c.baseline
 }
 
-// IsAlive 表示 maxAge（0 用 AliveTimeout）内收到过帧。
+// IsAlive 表示 maxAge（0 用 AliveTimeout）内收到过深度帧。
 func (c *Camera) IsAlive(maxAge time.Duration) bool {
 	if maxAge <= 0 {
 		maxAge = c.cfg.AliveTimeout
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dev != nil && time.Since(c.frameAt) <= maxAge
+	return c.dev != nil && c.depthErr == nil && time.Since(c.depthAt) <= maxAge
 }
 
 // LastError 返回离线原因，在线时为空。
@@ -273,7 +333,10 @@ func (c *Camera) LastError() string {
 	if c.dev.ControlLost() {
 		return "camera control taken by another program"
 	}
-	if age := time.Since(c.frameAt); age > c.cfg.AliveTimeout {
+	if c.depthErr != nil {
+		return c.depthErr.Error()
+	}
+	if age := time.Since(c.depthAt); age > c.cfg.AliveTimeout {
 		msg := fmt.Sprintf("no frames for %.0fs", age.Seconds())
 		if c.streamErr != nil {
 			msg += " (" + c.streamErr.Error() + ")"
@@ -283,10 +346,8 @@ func (c *Camera) LastError() string {
 	return ""
 }
 
-var errClosed = errors.New("camera is not open")
-
-// waitLocked 持锁调用，等下一帧或超时，返回时仍持锁。
-func (c *Camera) waitLocked(deadline time.Time) bool {
+// waitLocked 持锁调用，等下一帧、ctx 取消或超时，返回时仍持锁。
+func (c *Camera) waitLocked(ctx context.Context, deadline time.Time) bool {
 	ch := c.notify
 	c.mu.Unlock()
 	defer c.mu.Lock()
@@ -299,26 +360,38 @@ func (c *Camera) waitLocked(deadline time.Time) bool {
 	select {
 	case <-ch:
 		return true
+	case <-ctx.Done():
+		return false
 	case <-t.C:
 		return false
 	}
 }
 
-// GrabDepth 返回下一帧新的深度图。
+// GrabDepth 返回下一帧新的深度图；超时返回 ErrTimeout，关闭返回 ErrClosed。
 func (c *Camera) GrabDepth(timeout time.Duration) (*DepthFrame, error) {
+	return c.grabDepth(context.Background(), timeout)
+}
+
+func (c *Camera) grabDepth(ctx context.Context, timeout time.Duration) (*DepthFrame, error) {
 	deadline := time.Now().Add(timeout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.dev == nil {
-		return nil, errClosed
+		return nil, ErrClosed
 	}
 	seq := c.depthSeq
 	for c.depthSeq == seq {
-		if !c.waitLocked(deadline) && c.depthSeq == seq {
-			return nil, fmt.Errorf("no new depth frame within %v (%s)", timeout, c.errLocked())
+		if c.depthErr != nil {
+			return nil, c.depthErr
+		}
+		if !c.waitLocked(ctx, deadline) && c.depthSeq == seq {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: no new depth frame within %v (%s)", ErrTimeout, timeout, c.errLocked())
 		}
 		if c.dev == nil {
-			return nil, errClosed
+			return nil, ErrClosed
 		}
 	}
 	return c.ring[len(c.ring)-1], nil
@@ -331,21 +404,28 @@ func (c *Camera) errLocked() string {
 	return "no frames"
 }
 
-// RecentDepths 返回缓存里最近 n 帧（按时间先后）。最新一帧早于 maxAge 时等新帧，避免离线后用旧帧。
+// RecentDepths 返回缓存里最近 n 帧（按时间先后）。最新一帧早于 maxAge（0 用 AliveTimeout）时等新帧，
+// 避免离线后用旧帧。
 func (c *Camera) RecentDepths(n int, timeout, maxAge time.Duration) ([]*DepthFrame, error) {
 	n = max(1, min(n, c.cfg.RingSize))
+	if maxAge <= 0 {
+		maxAge = c.cfg.AliveTimeout
+	}
 	deadline := time.Now().Add(timeout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for {
 		if c.dev == nil {
-			return nil, errClosed
+			return nil, ErrClosed
+		}
+		if c.depthErr != nil {
+			return nil, c.depthErr
 		}
 		if time.Since(c.depthAt) <= maxAge && len(c.ring) >= n {
 			return append([]*DepthFrame(nil), c.ring[len(c.ring)-n:]...), nil
 		}
-		if !c.waitLocked(deadline) && time.Now().After(deadline) {
-			return nil, fmt.Errorf("no recent depth frames within %v (%s)", timeout, c.errLocked())
+		if !c.waitLocked(context.Background(), deadline) && time.Now().After(deadline) {
+			return nil, fmt.Errorf("%w: no recent depth frames within %v (%s)", ErrTimeout, timeout, c.errLocked())
 		}
 	}
 }
@@ -361,20 +441,20 @@ func (c *Camera) hasColorLocked() bool {
 	return c.color != nil && time.Since(c.colorAt) <= c.cfg.AliveTimeout
 }
 
-// GrabColor 返回最新的彩色帧，没有时最多等 timeout，仍没有则返回 nil。
+// GrabColor 返回最新的彩色帧，没有时最多等 timeout，仍没有则返回 ErrTimeout。
 func (c *Camera) GrabColor(timeout time.Duration) (*ColorFrame, error) {
 	deadline := time.Now().Add(timeout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.dev == nil {
-		return nil, errClosed
+		return nil, ErrClosed
 	}
 	for !c.hasColorLocked() {
-		if !c.waitLocked(deadline) && time.Now().After(deadline) {
-			return nil, nil
+		if !c.waitLocked(context.Background(), deadline) && time.Now().After(deadline) {
+			return nil, fmt.Errorf("%w: no color frame within %v", ErrTimeout, timeout)
 		}
 		if c.dev == nil {
-			return nil, errClosed
+			return nil, ErrClosed
 		}
 	}
 	return c.color, nil
@@ -386,7 +466,7 @@ func (c *Camera) LatestColor(newerThan uint64, timeout time.Duration) (*ColorFra
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for c.colorSeq <= newerThan && c.dev != nil {
-		if !c.waitLocked(deadline) && time.Now().After(deadline) {
+		if !c.waitLocked(context.Background(), deadline) && time.Now().After(deadline) {
 			break
 		}
 	}

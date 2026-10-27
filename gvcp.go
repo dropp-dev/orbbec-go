@@ -218,12 +218,6 @@ func (g *gvcpConn) nextReqID() uint16 {
 // transact 发一条命令，返回匹配 ackCode 和 reqID 的应答状态与负载。
 func (g *gvcpConn) transact(cmd []byte, ackCode, reqID uint16) (uint16, []byte, error) {
 	buf := make([]byte, 1500)
-	_ = g.conn.SetReadDeadline(time.Now())
-	for {
-		if _, _, err := g.conn.ReadFromUDP(buf); err != nil {
-			break
-		}
-	}
 	var lastErr error
 	for range g.retries + 1 {
 		if _, err := g.conn.WriteToUDP(cmd, g.dst); err != nil {
@@ -291,7 +285,10 @@ func (g *gvcpConn) WriteRegister(addr, value uint32) (uint16, error) {
 func (g *gvcpConn) Discover() (DiscoveredDevice, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	status, p, err := g.transact(discoveryCmd(), gvcpDiscoveryAck, 1)
+	id := g.nextReqID()
+	cmd := discoveryCmd()
+	binary.BigEndian.PutUint16(cmd[6:], id)
+	status, p, err := g.transact(cmd, gvcpDiscoveryAck, id)
 	if err != nil {
 		return DiscoveredDevice{}, err
 	}
@@ -332,17 +329,22 @@ type ccpController struct {
 	done   chan struct{}
 	serial string
 	lost   atomic.Bool
+	once   sync.Once
 }
 
-// acquireCCP 申请控制权并开始保活。相机不支持 CCP 时返回 nil, nil。
-func acquireCCP(g *gvcpConn, fwVersion int, serial string, log *slog.Logger) (*ccpController, error) {
+// acquireCCP 申请控制权并开始保活。固件太老或相机明确不支持 CCP 时返回 nil, nil；GVCP 不通是错误。
+// interval 为 0 时按相机的心跳超时定保活周期。
+func acquireCCP(g *gvcpConn, fwVersion int, serial string, log *slog.Logger, interval time.Duration) (*ccpController, error) {
 	if fwVersion > 0 && fwVersion < ccpMinFirmware {
 		log.Warn("firmware does not support CCP", "firmware", fwVersion)
 		return nil, nil
 	}
 	status, _, err := g.ReadRegister(regCapability)
-	if err != nil || (status != GevStatusSuccess && status != GevStatusAccessDenied) {
-		log.Warn("CCP not supported", "err", err, "status", fmt.Sprintf("%#04x", status))
+	if err != nil {
+		return nil, fmt.Errorf("read GVCP capability: %w", err)
+	}
+	if status != GevStatusSuccess && status != GevStatusAccessDenied {
+		log.Warn("CCP not supported", "status", fmt.Sprintf("%#04x", status))
 		return nil, nil
 	}
 	status, err = g.WriteRegister(regCCP, ccpControlAccess)
@@ -357,9 +359,11 @@ func acquireCCP(g *gvcpConn, fwVersion int, serial string, log *slog.Logger) (*c
 		return nil, fmt.Errorf("acquire control: GVCP status %#04x", status)
 	}
 
-	interval := time.Second
-	if st, v, err := g.ReadRegister(regHeartbeatTimeout); err == nil && st == GevStatusSuccess {
-		interval = max(time.Duration(v/3)*time.Millisecond, 500*time.Millisecond)
+	if interval <= 0 {
+		interval = time.Second
+		if st, v, err := g.ReadRegister(regHeartbeatTimeout); err == nil && st == GevStatusSuccess {
+			interval = min(max(time.Duration(v/3)*time.Millisecond, 500*time.Millisecond), 5*time.Second)
+		}
 	}
 	c := &ccpController{g: g, log: log, stop: make(chan struct{}), done: make(chan struct{}), serial: serial}
 	go c.keepalive(interval)
@@ -403,14 +407,16 @@ func (c *ccpController) keepalive(interval time.Duration) {
 	}
 }
 
-// release 停止保活并把 CCP 恢复成开放访问。
+// release 停止保活并把 CCP 恢复成开放访问，可重复调用。
 func (c *ccpController) release() {
 	if c == nil {
 		return
 	}
-	close(c.stop)
-	<-c.done
-	if status, err := c.g.WriteRegister(regCCP, ccpOpenAccess); err != nil || status != GevStatusSuccess {
-		c.log.Debug("release control failed", "err", err, "status", fmt.Sprintf("%#04x", status))
-	}
+	c.once.Do(func() {
+		close(c.stop)
+		<-c.done
+		if status, err := c.g.WriteRegister(regCCP, ccpOpenAccess); err != nil || status != GevStatusSuccess {
+			c.log.Debug("release control failed", "err", err, "status", fmt.Sprintf("%#04x", status))
+		}
+	})
 }
